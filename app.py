@@ -21,12 +21,21 @@ STORES={'Amazon México':'amazon.com.mx','Mercado Libre':'mercadolibre.com.mx','
 CATS=['Phones','Laptops / PCs','Gaming consoles','Tablets','TVs']
 LOCK=threading.RLock()
 def db():
- c=sqlite3.connect(DB);c.row_factory=sqlite3.Row;return c
+    if DATABASE_URL:
+        return psycopg.connect(
+            DATABASE_URL,
+            row_factory=psycopg.rows.dict_row
+        )
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
 
 def init():
- with db() as c:
-  c.executescript('''CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY,store TEXT NOT NULL,title TEXT NOT NULL,category TEXT NOT NULL,url TEXT NOT NULL,source TEXT NOT NULL DEFAULT 'manual',demo INTEGER NOT NULL DEFAULT 0, UNIQUE(store,url));
-CREATE TABLE IF NOT EXISTS prices(id INTEGER PRIMARY KEY,product_id INTEGER NOT NULL,price REAL NOT NULL,observed_at TEXT NOT NULL, FOREIGN KEY(product_id) REFERENCES products(id));
+    if DATABASE_URL:
+        return
+    with db() as c:
+        c.executescript("""CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY,store TEXT NOT NULL,title TEXT NOT NULL,category TEXT NOT NULL,url TEXT NOT NULL,source TEXT NOT NULL DEFAULT 'manual',demo INTEGER NOT NULL DEFAULT 0,UNIQUE(store,url));
+CREATE TABLE IF NOT EXISTS prices(id INTEGER PRIMARY KEY,product_id INTEGER NOT NULL,price REAL NOT NULL,observed_at TEXT NOT NULL,FOREIGN KEY(product_id) REFERENCES products(id));
 CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY,product_id INTEGER NOT NULL,price_id INTEGER NOT NULL,kind TEXT NOT NULL,created_at TEXT NOT NULL,telegram_sent INTEGER NOT NULL DEFAULT 0, UNIQUE(price_id,kind));''')
 
 def timestamp():return datetime.now(timezone.utc).isoformat(timespec='seconds')
@@ -45,6 +54,10 @@ def add_price(store,title,category,url,price,source='manual',demo=False,notify=F
  if u.scheme!='https' or not u.hostname or not (u.hostname==STORES[store] or u.hostname.endswith('.'+STORES[store])):raise ValueError('URL must be HTTPS on the selected retailer domain')
  if not isinstance(price,(int,float)) or not 0<price<10000000:raise ValueError('Invalid price')
  if not title.strip() or len(title)>250:raise ValueError('Invalid title')
+     if DATABASE_URL:
+        return add_price_postgres(
+            store, title, category, url, price, source, demo, notify
+        )
  with LOCK,db() as c:
   c.execute('INSERT OR IGNORE INTO products(store,title,category,url,source,demo) VALUES(?,?,?,?,?,?)',(store,title.strip(),category,url,source,int(demo)))
   p=c.execute('SELECT id,demo FROM products WHERE store=? AND url=?',(store,url)).fetchone()
@@ -57,8 +70,75 @@ def add_price(store,title,category,url,price,source='manual',demo=False,notify=F
   if assessment['discount']>=40 and not demo:
    c.execute('INSERT OR IGNORE INTO alerts(product_id,price_id,kind,created_at) VALUES(?,?,?,?)',(p['id'],cur.lastrowid,kind,now))
   return assessment
+def add_price_postgres(store, title, category, url, price, source='manual', demo=False, notify=False):
+    if demo:
+        raise ValueError("Demo observations cannot be stored as real prices")
 
+    with LOCK:
+        with db() as c:
+            with c.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO public.products (store, title, category, url, source)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (store, url)
+                    DO UPDATE SET title = EXCLUDED.title,
+                                  category = EXCLUDED.category
+                    RETURNING id
+                """, (store, title.strip(), category, url, source))
+
+                product_id = cur.fetchone()['id']
+
+                cur.execute("""
+                    SELECT price
+                    FROM public.price_history
+                    WHERE product_id = %s
+                    ORDER BY observed_at DESC
+                    LIMIT 30
+                """, (product_id,))
+
+                previous = [float(row['price']) for row in cur.fetchall()]
+
+                cur.execute("""
+                    INSERT INTO public.price_history (product_id, price, observed_at)
+                    VALUES (%s, %s, NOW())
+                """, (product_id, price))
+
+                return analyze(previous + [price])
 def products():
+    if DATABASE_URL:
+        with db() as c:
+            with c.cursor() as cur:
+                cur.execute("""
+                    SELECT p.*, h.price, h.observed_at
+                    FROM public.products p
+                    JOIN LATERAL (
+                        SELECT price, observed_at
+                        FROM public.price_history
+                        WHERE product_id = p.id
+                        ORDER BY observed_at DESC
+                        LIMIT 1
+                    ) h ON TRUE
+                    ORDER BY p.id DESC
+                """)
+                rows = cur.fetchall()
+                out = []
+
+                for r in rows:
+                    item = dict(r)
+                    cur.execute("""
+                        SELECT price
+                        FROM public.price_history
+                        WHERE product_id = %s
+                        ORDER BY observed_at ASC
+                    """, (item['id'],))
+                    values = [float(x['price']) for x in cur.fetchall()]
+                    item['price'] = float(item['price'])
+                    item['observed_at'] = item['observed_at'].isoformat()
+                    item['samples'] = len(values)
+                    item.update(analyze(values))
+                    out.append(item)
+
+                return out
  with db() as c:
   rows=c.execute('SELECT * FROM products WHERE demo=0 ORDER BY id DESC').fetchall();out=[]
   for r in rows:
@@ -222,10 +302,32 @@ class Handler(BaseHTTPRequestHandler):
                 pid=int(parse_qs(p.query)['id'][0])
             except (KeyError,ValueError,IndexError):
                 return self.send(400,{'error':'Invalid id'})
-            with db() as c:
-                rows=[dict(x) for x in c.execute('SELECT price,observed_at FROM prices WHERE product_id=? ORDER BY id',(pid,))]
-            return self.send(200,{'history':rows})
+            if DATABASE_URL:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT price, observed_at
+                            FROM public.price_history
+                            WHERE product_id = %s
+                            ORDER BY observed_at ASC
+                        """, (pid,))
+                        rows = [
+                            {
+                                'price': float(r['price']),
+                                'observed_at': r['observed_at'].isoformat()
+                            }
+                            for r in cur.fetchall()
+                        ]
+            else:
+                with db() as c:
+                    rows = [
+                        dict(x) for x in c.execute(
+                            'SELECT price,observed_at FROM prices WHERE product_id=? ORDER BY id',
+                            (pid,)
+                        )
+                    ]
 
+            return self.send(200, {'history': rows})
         if p.path=='/manifest.webmanifest':
             return self.send(200,{'name':'DealRadar MX','short_name':'DealRadar','start_url':'/','display':'standalone','background_color':'#0b1220','theme_color':'#0c1425','icons':[]},'application/manifest+json')
 
