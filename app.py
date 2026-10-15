@@ -208,16 +208,16 @@ class Handler(BaseHTTPRequestHandler):
         if p.path=='/':
             page=HTML
             return self.send(200,page,'text/html')
-  if p.path=='/api/products':return self.send(200,products())
-  if p.path=='/api/status':return self.send(200,dict(SCAN_STATE))
-  if p.path=='/api/history':
-   try:pid=int(parse_qs(p.query)['id'][0])
-   except (KeyError,ValueError,IndexError):return self.send(400,{'error':'Invalid id'})
-   with db() as c: rows=[dict(x) for x in c.execute('SELECT price,observed_at FROM prices WHERE product_id=? ORDER BY id',(pid,))]
-   return self.send(200,{'history':rows})
-  if p.path=='/manifest.webmanifest':return self.send(200,{'name':'DealRadar MX','short_name':'DealRadar','start_url':'/','display':'standalone','background_color':'#0b1220','theme_color':'#0c1425','icons':[]},'application/manifest+json')
-  if p.path=='/sw.js':return self.send(200,"self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));",'application/javascript')
-  self.send(404,{'error':'Not found'})
+        if p.path=='/api/products':return self.send(200,products())
+        if p.path=='/api/status':return self.send(200,dict(SCAN_STATE))
+        if p.path=='/api/history':
+        try:pid=int(parse_qs(p.query)['id'][0])
+        except (KeyError,ValueError,IndexError):return self.send(400,{'error':'Invalid id'})
+        with db() as c: rows=[dict(x) for x in c.execute('SELECT price,observed_at FROM prices WHERE product_id=? ORDER BY id',(pid,))]
+        return self.send(200,{'history':rows})
+        if p.path=='/manifest.webmanifest':return self.send(200,{'name':'DealRadar MX','short_name':'DealRadar','start_url':'/','display':'standalone','background_color':'#0b1220','theme_color':'#0c1425','icons':[]},'application/manifest+json')
+        if p.path=='/sw.js':return self.send(200,"self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));",'application/javascript')
+        self.send(404,{'error':'Not found'})
  def do_POST(self):
   if not os.environ.get('DEALRADAR_WRITE_TOKEN'):return self.send(403,{'error':'Manual observations disabled'})
   import hmac
