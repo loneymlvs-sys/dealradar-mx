@@ -120,7 +120,31 @@ class Handler(BaseHTTPRequestHandler):
   body=data.encode() if isinstance(data,str) else json.dumps(data,ensure_ascii=False).encode()
   self.send_response(status);self.send_header('Content-Type',typ+'; charset=utf-8');self.send_header('Content-Length',str(len(body)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(body)
  def do_GET(self):
-  p=urlparse(self.path)
+        p=urlparse(self.path)
+        if p.path == '/oauth/login':
+            if not ML_CLIENT_ID or not ML_CLIENT_SECRET:
+                return self.send(503, {'error': 'Mercado Libre credentials not configured'})
+
+            import secrets
+            from urllib.parse import urlencode
+
+            state = secrets.token_urlsafe(32)
+            self.send_response(302)
+            self.send_header(
+                'Set-Cookie',
+                f'ml_oauth_state={state}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=600'
+            )
+            self.send_header(
+                'Location',
+                'https://auth.mercadolibre.com.mx/authorization?' + urlencode({
+                    'response_type': 'code',
+                    'client_id': ML_CLIENT_ID,
+                    'redirect_uri': ML_REDIRECT_URI,
+                    'state': state
+                })
+            )
+            self.end_headers()
+            return
   if p.path=='/':
    page=HTML
    return self.send(200,page,'text/html')
