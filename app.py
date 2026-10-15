@@ -205,7 +205,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-  if p.path=='/':
+        if p.path=='/':
             page=HTML
             return self.send(200,page,'text/html')
   if p.path=='/api/products':return self.send(200,products())
