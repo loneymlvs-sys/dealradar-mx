@@ -1,14 +1,17 @@
 """DealRadar MX local prototype. Python 3.10+, no third-party packages."""
-import csv, io, json, os, sqlite3, statistics, threading, urllib.request
+import csv, io, json, os, sqlite3, statistics, threading, urllib.request, time, traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 ROOT=Path(__file__).parent
 DB=Path(os.environ.get('DEALRADAR_DB',str(ROOT/'dealradar.sqlite3')))
 PORT=int(os.environ.get('PORT','8080'))
 PUBLIC_DEMO=os.environ.get('PUBLIC_DEMO','0')=='1'
+SCAN_INTERVAL=max(300,int(os.environ.get('SCAN_INTERVAL_SECONDS','900')))
+ML_TOKEN=os.environ.get('MERCADOLIBRE_ACCESS_TOKEN','')
+SCAN_STATE={'last_attempt':None,'last_success':None,'last_error':None,'last_count':0,'status':'waiting for Mercado Libre authorization' if not ML_TOKEN else 'starting'}
 STORES={'Amazon México':'amazon.com.mx','Mercado Libre':'mercadolibre.com.mx','Coppel':'coppel.com','Elektra':'elektra.mx'}
 CATS=['Phones','Laptops / PCs','Gaming consoles','Tablets','TVs']
 LOCK=threading.RLock()
@@ -31,18 +34,7 @@ def analyze(values):
  # A large drop against the observed median is a *candidate*, not proof.
  return {'discount':discount,'error':discount>=60,'baseline':round(baseline,2)}
 
-def telegram(message):
- token=os.environ.get('TELEGRAM_BOT_TOKEN',''); chat=os.environ.get('TELEGRAM_CHAT_ID','')
- if not (token and chat):return False
- from urllib.parse import urlencode
- data=urlencode({'chat_id':chat,'text':message,'disable_web_page_preview':'true'}).encode()
- try:
-  req=urllib.request.Request('https://api.telegram.org/bot'+token+'/sendMessage',data=data,method='POST')
-  with urllib.request.urlopen(req,timeout=8) as r:return json.load(r).get('ok',False)
- except Exception as e:
-  print('Telegram error:',str(e));return False
-
-def add_price(store,title,category,url,price,source='manual',demo=False,notify=True):
+def add_price(store,title,category,url,price,source='manual',demo=False,notify=False):
  if store not in STORES or category not in CATS:raise ValueError('Invalid store or category')
  u=urlparse(url)
  if u.scheme!='https' or not u.hostname or not (u.hostname==STORES[store] or u.hostname.endswith('.'+STORES[store])):raise ValueError('URL must be HTTPS on the selected retailer domain')
@@ -59,16 +51,11 @@ def add_price(store,title,category,url,price,source='manual',demo=False,notify=T
   assessment=analyze(previous+[price]);kind='potential_error' if assessment['error'] else 'discount'
   if assessment['discount']>=40 and not demo:
    c.execute('INSERT OR IGNORE INTO alerts(product_id,price_id,kind,created_at) VALUES(?,?,?,?)',(p['id'],cur.lastrowid,kind,now))
-   # Send only on crossing a threshold, not on every repeated low-price observation.
-   prior=analyze(previous)
-   if notify and prior['discount']<40:
-    msg=f"🚨 DealRadar MX: {kind.replace('_',' ').upper()}\n{title}\n{store}: ${price:,.2f} MXN\nDrop vs observed median: {assessment['discount']}%\n{url}\nVerify seller, condition and checkout price."
-    if telegram(msg):c.execute('UPDATE alerts SET telegram_sent=1 WHERE price_id=?',(cur.lastrowid,))
   return assessment
 
 def products():
  with db() as c:
-  rows=c.execute('SELECT * FROM products ORDER BY id DESC').fetchall();out=[]
+  rows=c.execute('SELECT * FROM products WHERE demo=0 ORDER BY id DESC').fetchall();out=[]
   for r in rows:
    values=c.execute('SELECT price,observed_at FROM prices WHERE product_id=? ORDER BY id',(r['id'],)).fetchall()
    if not values:continue
@@ -80,14 +67,49 @@ def seed():
  for store,title,cat,url,old,new in examples:
   for price in [old,old,old,new]:add_price(store,title,cat,url,price,source='sample',demo=True,notify=False)
 
+# Queries are intentionally bounded to limit API usage and avoid treating unrelated variants as the same product.
+SEARCHES=[('Phones','Samsung Galaxy S Ultra'),('Phones','OnePlus smartphone'),('Phones','iPhone'),('Laptops / PCs','laptop gamer'),('Laptops / PCs','PC gamer'),('Gaming consoles','PlayStation 5'),('Gaming consoles','Xbox Series X'),('Tablets','Samsung Galaxy Tab'),('TVs','Smart TV 55')]
+
+def scan_once():
+ if not ML_TOKEN:
+  SCAN_STATE.update(status='authorization required',last_error='Set MERCADOLIBRE_ACCESS_TOKEN in Render Environment')
+  return 0
+ SCAN_STATE.update(status='scanning',last_attempt=timestamp(),last_error=None)
+ total=0; errors=[]
+ for category,query in SEARCHES:
+  try:
+   endpoint='https://api.mercadolibre.com/sites/MLM/search?'+urlencode({'q':query,'limit':15})
+   req=urllib.request.Request(endpoint,headers={'Authorization':'Bearer '+ML_TOKEN,'Accept':'application/json','User-Agent':'DealRadarMX/1.3'})
+   with urllib.request.urlopen(req,timeout=20) as response:payload=json.load(response)
+   for item in payload.get('results',[]):
+    try:
+     if item.get('condition') not in (None,'new'):continue
+     if item.get('currency_id')!='MXN':continue
+     price=item.get('price');url=item.get('permalink');title=item.get('title','')
+     if not isinstance(price,(int,float)) or not url or not title:continue
+     add_price('Mercado Libre',title,category,url,price,source='mercadolibre_api')
+     total+=1
+    except (ValueError,TypeError) as e:errors.append(str(e))
+  except Exception as e:
+   errors.append(type(e).__name__+': '+str(e)[:180])
+ SCAN_STATE.update(last_count=total,last_error='; '.join(errors[:3]) if errors else None,status='partial' if errors and total else ('error' if errors else 'ok'))
+ if total:SCAN_STATE['last_success']=timestamp()
+ return total
+
+def scan_loop():
+ while True:
+  try:scan_once()
+  except Exception as e:SCAN_STATE.update(status='error',last_error=str(e)[:250]);print('Scanner error:',traceback.format_exc())
+  time.sleep(SCAN_INTERVAL)
+
 HTML='''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0c1425"><link rel="manifest" href="/manifest.webmanifest"><title>DealRadar MX</title><style>
 :root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#eaf0ff;background:#0b1220}*{box-sizing:border-box}body{margin:0}main{max-width:1150px;margin:auto;padding:22px}header,.between{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}header{padding:12px 0 25px}h1{font-size:25px;margin:0}h2{font-size:19px}p,small,.muted{color:#9eacc7}.logo{color:#5ee1a4}.pill{border:1px solid #315847;background:#14372c;color:#75f5ba;padding:7px 11px;border-radius:30px;font-size:12px}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.stat,.panel,.item{border:1px solid #28374f;background:#131f32;border-radius:16px;padding:18px}.stat strong{display:block;font-size:27px;margin-top:8px}.toolbar{display:flex;flex-wrap:wrap;gap:10px;margin:22px 0}select,input,button{background:#192941;color:#eaf0ff;border:1px solid #34455e;border-radius:9px;padding:11px;font:inherit}button{cursor:pointer}button:hover{border-color:#67dfab}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.item h3{margin:0 0 7px}.price{font-size:25px;font-weight:750;color:#71f2b2}.off{color:#71f2b2;font-weight:700}.warning{color:#ffbd69}.row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}a{color:#8cc4ff}.item p{margin:8px 0}.tag{font-size:12px;color:#b9c7df}.panel{margin-top:20px}.formgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}.formgrid input,.formgrid select{width:100%}.full{grid-column:1/-1}.notice{background:#342a18;color:#f7d69b;border-radius:10px;padding:12px;margin:16px 0}.empty{padding:30px;color:#9eacc7;text-align:center}svg{width:100%;height:90px}footer{margin:30px 0;color:#8c9ab2;font-size:12px}@media(max-width:680px){.grid,.formgrid{grid-template-columns:1fr}.stats{grid-template-columns:1fr 1fr}.stat strong{font-size:22px}main{padding:14px}}
-</style></head><body><main><header><div><h1><span class="logo">◉</span> DealRadar MX</h1><small>Electronics deal intelligence · Mexico</small></div><span class="pill">● Local prototype</span></header><div class="stats"><div class="stat"><small>Products monitored</small><strong id="count">—</strong></div><div class="stat"><small>Deals ≥ 40%</small><strong id="deals">—</strong></div><div class="stat"><small>Potential errors</small><strong id="errors">—</strong></div></div><div class="notice" id="notice">Demo products are fictional examples. No retailer is being scanned automatically in this version.</div><div class="toolbar"><input id="q" placeholder="Search products or brands…" aria-label="Search"><select id="category"><option value="">All categories</option><option>Phones</option><option>Laptops / PCs</option><option>Gaming consoles</option><option>Tablets</option><option>TVs</option></select><select id="store"><option value="">All stores</option><option>Amazon México</option><option>Mercado Libre</option><option>Coppel</option><option>Elektra</option></select><select id="kind"><option value="">All products</option><option value="deal">40%+ deals</option><option value="error">Potential errors</option></select></div><div class="between"><h2>Price observations</h2><small id="shown"></small></div><div id="items" class="grid"></div><section class="panel"><h2>Add a verified price observation</h2><p>Enter the actual product page URL and a price you verified. Add at least 3 historical observations before a later drop can be classified. Prices are in MXN.</p><form id="form" class="formgrid"><input name="title" placeholder="Exact product name / variant" required maxlength="250"><select name="store" required><option>Amazon México</option><option>Mercado Libre</option><option>Coppel</option><option>Elektra</option></select><select name="category"><option>Phones</option><option>Laptops / PCs</option><option>Gaming consoles</option><option>Tablets</option><option>TVs</option></select><input name="price" type="number" min="1" max="9999999" step="0.01" placeholder="Price MXN" required><input class="full" name="url" type="url" placeholder="https://www.retailer.com/product..." required><button class="full">Save price observation</button></form><p id="status" role="status"></p></section><footer>Threshold: 40% vs median of up to 30 previous observations. Potential error: 60%+ drop. Candidate only — not a confirmed pricing mistake. Telegram needs backend environment variables. PWA installation requires localhost or HTTPS.</footer></main><script>
+</style></head><body><main><header><div><h1><span class="logo">◉</span> DealRadar MX</h1><small>Electronics deal intelligence · Mexico</small></div><span class="pill">● Live tracking dashboard</span></header><div class="stats"><div class="stat"><small>Products monitored</small><strong id="count">—</strong></div><div class="stat"><small>Deals ≥ 40%</small><strong id="deals">—</strong></div><div class="stat"><small>Potential errors</small><strong id="errors">—</strong></div></div><div class="notice" id="notice">Checking scanner configuration…</div><div class="toolbar"><input id="q" placeholder="Search products or brands…" aria-label="Search"><select id="category"><option value="">All categories</option><option>Phones</option><option>Laptops / PCs</option><option>Gaming consoles</option><option>Tablets</option><option>TVs</option></select><select id="store"><option value="">All stores</option><option>Amazon México</option><option>Mercado Libre</option><option>Coppel</option><option>Elektra</option></select><select id="kind"><option value="">All products</option><option value="deal">40%+ deals</option><option value="error">Potential errors</option></select></div><div class="between"><h2>Price observations</h2><small id="scanner"></small><small id="shown"></small></div><div id="items" class="grid"></div><section class="panel" style="display:none"><h2>Add a verified price observation</h2><p>Enter the actual product page URL and a price you verified. Add at least 3 historical observations before a later drop can be classified. Prices are in MXN.</p><form id="form" class="formgrid"><input name="title" placeholder="Exact product name / variant" required maxlength="250"><select name="store" required><option>Amazon México</option><option>Mercado Libre</option><option>Coppel</option><option>Elektra</option></select><select name="category"><option>Phones</option><option>Laptops / PCs</option><option>Gaming consoles</option><option>Tablets</option><option>TVs</option></select><input name="price" type="number" min="1" max="9999999" step="0.01" placeholder="Price MXN" required><input class="full" name="url" type="url" placeholder="https://www.retailer.com/product..." required><button class="full">Save price observation</button></form><p id="status" role="status"></p></section><footer>Threshold: 40% vs median of up to 30 previous observations. Potential error: 60%+ drop. Candidate only — not a confirmed pricing mistake. Live listings require authorized retailer access. Dashboard refresh: 30 seconds. Price history may reset on free ephemeral hosting.</footer></main><script>
 let all=[];const money=n=>new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',maximumFractionDigits:0}).format(n);const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function render(){let q=document.querySelector('#q').value.toLowerCase(),cat=document.querySelector('#category').value,store=document.querySelector('#store').value,kind=document.querySelector('#kind').value;let rows=all.filter(p=>(p.title+' '+p.store).toLowerCase().includes(q)&&(!cat||p.category===cat)&&(!store||p.store===store)&&(!kind||(kind==='deal'?p.discount>=40:p.error)));document.querySelector('#shown').textContent=rows.length+' shown';document.querySelector('#items').innerHTML=rows.map(p=>`<article class="item"><div class="row"><span class="tag">${esc(p.store)} · ${esc(p.category)}</span>${p.demo?'<span class="pill">DEMO</span>':''}</div><h3>${esc(p.title)}</h3><p class="price">${money(p.price)}</p><div class="row"><span class="${p.error?'warning':'off'}">${p.baseline===null?'Building price history':p.error?'⚠ Potential pricing error · -'+p.discount+'%':p.discount>=40?'↓ '+p.discount+'% vs history':'Change vs history: '+p.discount+'%'}</span><small>${p.samples} samples</small></div><p><small>Historical median: ${p.baseline===null?'not established':money(p.baseline)}</small></p><a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">View retailer page ↗</a> <button data-history="${p.id}">Price history</button><div id="history-${p.id}"></div></article>`).join('')||'<div class="empty">No matching products yet.</div>';document.querySelectorAll('[data-history]').forEach(b=>b.onclick=()=>history(b.dataset.history));}
 async function history(id){let r=await fetch('/api/history?id='+encodeURIComponent(id));let j=await r.json();let el=document.getElementById('history-'+id);el.innerHTML='<p><small>'+j.history.map(x=>money(x.price)+' ('+x.observed_at.slice(0,10)+')').join(' → ')+'</small></p>';}
-async function load(){let r=await fetch('/api/products');all=await r.json();document.querySelector('#count').textContent=all.length;document.querySelector('#deals').textContent=all.filter(x=>x.discount>=40).length;document.querySelector('#errors').textContent=all.filter(x=>x.error).length;document.querySelector('#notice').textContent=all.some(x=>x.demo)?'Demo products are fictional examples and cannot be purchased. Real prices must be entered or imported from an authorized source.':'Manual observations only. Automatic retailer connections are not configured.';render();}
-['q','category','store','kind'].forEach(id=>document.getElementById(id).addEventListener('input',render));document.querySelector('#form').onsubmit=async e=>{e.preventDefault();let data=Object.fromEntries(new FormData(e.target));data.price=Number(data.price);let r=await fetch('/api/observations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});let j=await r.json();document.querySelector('#status').textContent=r.ok?'Observation saved.':j.error||'Error';if(r.ok){e.target.reset();load();}};load();if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
+async function load(){let r=await fetch('/api/products');all=await r.json();document.querySelector('#count').textContent=all.length;document.querySelector('#deals').textContent=all.filter(x=>x.discount>=40).length;document.querySelector('#errors').textContent=all.filter(x=>x.error).length;let st=await (await fetch('/api/status',{cache:'no-store'})).json();document.querySelector('#notice').textContent=st.status==='ok'?'Mercado Libre scan active. Other retailers awaiting authorized integrations.':st.status==='partial'?'Some listings imported; scanner reported errors. Check status below.':'Live prices unavailable: '+(st.last_error||st.status)+'. No sample deals are displayed.';document.querySelector('#scanner').textContent='Scanner: '+st.status+' · Last successful scan: '+(st.last_success||'never')+' · Last scan items: '+st.last_count;render();}
+['q','category','store','kind'].forEach(id=>document.getElementById(id).addEventListener('input',render));document.querySelector('#form').onsubmit=async e=>{e.preventDefault();let data=Object.fromEntries(new FormData(e.target));data.price=Number(data.price);let r=await fetch('/api/observations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});let j=await r.json();document.querySelector('#status').textContent=r.ok?'Observation saved.':j.error||'Error';if(r.ok){e.target.reset();load();}};load();setInterval(()=>load().catch(console.error),30000);if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 </script></body></html>'''
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,8 +121,8 @@ class Handler(BaseHTTPRequestHandler):
   if p.path=='/':
    page=HTML
    if PUBLIC_DEMO:
-    page=page.replace('<section class="panel"><h2>Add a verified price observation', '<section class="panel" style="display:none"><h2>Add a verified price observation')
-    page=page.replace('● Local prototype','● Public demo · no live scans')
+    page=page.replace('<section class="panel" style="display:none"><h2>Add a verified price observation', '<section class="panel" style="display:none"><h2>Add a verified price observation')
+    page=page.replace('● Live tracking dashboard','● Public demo · no live scans')
    return self.send(200,page,'text/html')
   if p.path=='/api/products':return self.send(200,products())
   if p.path=='/api/history':
@@ -128,4 +150,4 @@ if __name__=='__main__':
   if products():print('Database is not empty; demo data not added')
   else:seed();print('Demo observations added')
  print(f'DealRadar MX: http://localhost:{PORT}')
- ThreadingHTTPServer(('0.0.0.0' if PUBLIC_DEMO else '127.0.0.1',PORT),Handler).serve_forever()
+ ThreadingHTTPServer(('0.0.0.0',PORT),Handler).serve_forever()
