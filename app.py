@@ -145,7 +145,67 @@ class Handler(BaseHTTPRequestHandler):
             )
             self.end_headers()
             return
-        if p.path=='/':
+       
+        if p.path == '/oauth/callback':
+            import hmac
+            from http.cookies import SimpleCookie
+
+            params = parse_qs(p.query)
+            code = params.get('code', [''])[0]
+            state = params.get('state', [''])[0]
+
+            cookies = SimpleCookie()
+            try:
+                cookies.load(self.headers.get('Cookie', ''))
+                expected = cookies['ml_oauth_state'].value
+            except (KeyError, ValueError):
+                expected = ''
+
+            if not state or not expected or not hmac.compare_digest(state, expected):
+                return self.send(403, {'error': 'Invalid OAuth state'})
+
+            if not code:
+                return self.send(400, {'error': 'Authorization code missing'})
+             
+            payload = urlencode({
+                'grant_type': 'authorization_code',
+                'client_id': ML_CLIENT_ID,
+                'client_secret': ML_CLIENT_SECRET,
+                'code': code,
+                'redirect_uri': ML_REDIRECT_URI
+            }).encode('utf-8')
+
+            request = urllib.request.Request(
+                'https://api.mercadolibre.com/oauth/token',
+                data=payload,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                method='POST'
+            )
+
+            try:
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    token_data = json.load(response)
+            except Exception:
+                return self.send(502, {'error': 'Token exchange failed'})
+
+            if not token_data.get('access_token'):
+                return self.send(502, {'error': 'No access token returned'})
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header(
+                'Set-Cookie',
+                'ml_oauth_state=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0'
+            )
+            self.end_headers()
+            self.wfile.write(
+                b'Mercado Libre authorization succeeded. '
+                b'Secure token storage still needs to be configured.'
+            )
+            return
+
+  if p.path=='/':
             page=HTML
             return self.send(200,page,'text/html')
   if p.path=='/api/products':return self.send(200,products())
