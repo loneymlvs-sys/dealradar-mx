@@ -126,7 +126,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(503, {'error': 'Mercado Libre credentials not configured'})
 
             import secrets
-            from urllib.parse import urlencode
 
             state = secrets.token_urlsafe(32)
             self.send_response(302)
