@@ -145,9 +145,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             self.end_headers()
             return
-  if p.path=='/':
-   page=HTML
-   return self.send(200,page,'text/html')
+        if p.path=='/':
+            page=HTML
+            return self.send(200,page,'text/html')
   if p.path=='/api/products':return self.send(200,products())
   if p.path=='/api/status':return self.send(200,dict(SCAN_STATE))
   if p.path=='/api/history':
