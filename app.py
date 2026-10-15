@@ -1,5 +1,5 @@
 """DealRadar MX local prototype. Python 3.10+, no third-party packages."""
-import csv, io, json, os, sqlite3, statistics, threading, urllib.request, time, traceback
+import csv, io, json, os, sqlite3, statistics, threading, urllib.request, time, traceback 
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -11,6 +11,9 @@ PORT=int(os.environ.get('PORT','8080'))
 PUBLIC_DEMO=os.environ.get('PUBLIC_DEMO','0')=='1'
 SCAN_INTERVAL=max(300,int(os.environ.get('SCAN_INTERVAL_SECONDS','900')))
 ML_TOKEN=os.environ.get('MERCADOLIBRE_ACCESS_TOKEN','')
+ML_CLIENT_ID=os.environ.get('MERCADOLIBRE_CLIENT_ID','')
+ML_CLIENT_SECRET=os.environ.get('MERCADOLIBRE_CLIENT_SECRET','')
+ML_REDIRECT_URI='https://dealradar-mx-demo.onrender.com/oauth/callback'
 SCAN_STATE={'last_attempt':None,'last_success':None,'last_error':None,'last_count':0,'status':'authorization required' if not ML_TOKEN else 'starting'}
 STORES={'Amazon México':'amazon.com.mx','Mercado Libre':'mercadolibre.com.mx','Coppel':'coppel.com','Elektra':'elektra.mx'}
 CATS=['Phones','Laptops / PCs','Gaming consoles','Tablets','TVs']
