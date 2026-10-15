@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: dealradar-mx-demo
+    runtime: python
+    plan: free
+    buildCommand: "echo No dependencies required"
+    startCommand: "python app.py"
+    healthCheckPath: /api/products
+    envVars:
+      - key: PUBLIC_DEMO
+        value: "1"
+      - key: PYTHON_VERSION
+        value: "3.13.7"
