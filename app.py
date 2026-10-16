@@ -139,14 +139,6 @@ def products():
                     out.append(item)
 
                 return out
- with db() as c:
-  rows=c.execute('SELECT * FROM products WHERE demo=0 ORDER BY id DESC').fetchall();out=[]
-  for r in rows:
-   values=c.execute('SELECT price,observed_at FROM prices WHERE product_id=? ORDER BY id',(r['id'],)).fetchall()
-   if not values:continue
-   a=analyze([v['price'] for v in values]);d=dict(r);d.update(a);d['price']=values[-1]['price'];d['observed_at']=values[-1]['observed_at'];d['samples']=len(values);out.append(d)
-  return out
-
 def seed():
  examples=[('Amazon México','Samsung Galaxy S25 Ultra 256GB','Phones','https://www.amazon.com.mx/dp/DEMO-S25',25999,15999),('Mercado Libre','OnePlus 13 256GB','Phones','https://www.mercadolibre.com.mx/p/DEMO-ONEPLUS',19999,11999),('Coppel','Laptop gaming RTX 4060','Laptops / PCs','https://www.coppel.com/demo-laptop',22999,12999),('Elektra','PlayStation 5','Gaming consoles','https://www.elektra.mx/demo-ps5',12999,5999),('Amazon México','Tablet Android 11 pulgadas','Tablets','https://www.amazon.com.mx/dp/DEMO-TABLET',8999,4999),('Coppel','Smart TV 55 pulgadas','TVs','https://www.coppel.com/demo-tv',14999,7999)]
  for store,title,cat,url,old,new in examples:
