@@ -125,12 +125,12 @@ def products():
 
                 for r in rows:
                     item = dict(r)
-                    cur.execute("""
-                        SELECT price
-                        FROM public.price_history
-                        WHERE product_id = %s
-                        ORDER BY observed_at ASC
-                    """, (item['id'],))
+            cur.execute("""
+                SELECT price
+                FROM public.price_history
+                WHERE product_id = %s
+                ORDER BY observed_at ASC
+            """, (item['id'],))
                     values = [float(x['price']) for x in cur.fetchall()]
                     item['price'] = float(item['price'])
                     item['observed_at'] = item['observed_at'].isoformat()
