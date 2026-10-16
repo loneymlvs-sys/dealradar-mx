@@ -305,12 +305,10 @@ class Handler(BaseHTTPRequestHandler):
             if DATABASE_URL:
                 with db() as conn:
                     with conn.cursor() as cur:
-                        cur.execute("""
-                            SELECT price, observed_at
-                            FROM public.price_history
-                            WHERE product_id = %s
-                            ORDER BY observed_at ASC
-                        """, (pid,))
+                        cur.execute(
+                            "SELECT price, observed_at FROM public.price_history WHERE product_id = %s ORDER BY observed_at ASC",
+                            (pid,)
+                        )
                         rows = [
                             {
                                 'price': float(r['price']),
