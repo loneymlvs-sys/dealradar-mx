@@ -1,6 +1,9 @@
 """DealRadar MX local prototype. Python 3.10+, no third-party packages."""
 import csv, io, json, os, sqlite3, statistics, threading, urllib.request, time, traceback 
-import psycopg
+try:
+    import psycopg
+except ImportError:  # PostgreSQL support is optional when using SQLite.
+    psycopg = None
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +25,8 @@ CATS=['Phones','Laptops / PCs','Gaming consoles','Tablets','TVs']
 LOCK=threading.RLock()
 def db():
     if DATABASE_URL:
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL is set, but psycopg is not installed; add psycopg[binary] to requirements.txt")
         return psycopg.connect(
             DATABASE_URL,
             row_factory=psycopg.rows.dict_row
@@ -36,7 +41,7 @@ def init():
     with db() as c:
         c.executescript("""CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY,store TEXT NOT NULL,title TEXT NOT NULL,category TEXT NOT NULL,url TEXT NOT NULL,source TEXT NOT NULL DEFAULT 'manual',demo INTEGER NOT NULL DEFAULT 0,UNIQUE(store,url));
 CREATE TABLE IF NOT EXISTS prices(id INTEGER PRIMARY KEY,product_id INTEGER NOT NULL,price REAL NOT NULL,observed_at TEXT NOT NULL,FOREIGN KEY(product_id) REFERENCES products(id));
-CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY,product_id INTEGER NOT NULL,price_id INTEGER NOT NULL,kind TEXT NOT NULL,created_at TEXT NOT NULL,telegram_sent INTEGER NOT NULL DEFAULT 0, UNIQUE(price_id,kind));''')
+CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY,product_id INTEGER NOT NULL,price_id INTEGER NOT NULL,kind TEXT NOT NULL,created_at TEXT NOT NULL,telegram_sent INTEGER NOT NULL DEFAULT 0, UNIQUE(price_id,kind));""")
 
 def timestamp():return datetime.now(timezone.utc).isoformat(timespec='seconds')
 def analyze(values):
@@ -54,10 +59,10 @@ def add_price(store,title,category,url,price,source='manual',demo=False,notify=F
  if u.scheme!='https' or not u.hostname or not (u.hostname==STORES[store] or u.hostname.endswith('.'+STORES[store])):raise ValueError('URL must be HTTPS on the selected retailer domain')
  if not isinstance(price,(int,float)) or not 0<price<10000000:raise ValueError('Invalid price')
  if not title.strip() or len(title)>250:raise ValueError('Invalid title')
-     if DATABASE_URL:
-        return add_price_postgres(
-            store, title, category, url, price, source, demo, notify
-        )
+ if DATABASE_URL:
+  return add_price_postgres(
+      store, title, category, url, price, source, demo, notify
+  )
  with LOCK,db() as c:
   c.execute('INSERT OR IGNORE INTO products(store,title,category,url,source,demo) VALUES(?,?,?,?,?,?)',(store,title.strip(),category,url,source,int(demo)))
   p=c.execute('SELECT id,demo FROM products WHERE store=? AND url=?',(store,url)).fetchone()
@@ -137,6 +142,37 @@ def products():
                     out.append(item)
 
                 return out
+
+    # SQLite fallback for local development or deployments without DATABASE_URL.
+    with LOCK, db() as c:
+        rows = c.execute("""
+            SELECT p.*, latest.price, latest.observed_at
+            FROM products AS p
+            JOIN (
+                SELECT product_id, price, observed_at
+                FROM prices AS px
+                WHERE id = (
+                    SELECT MAX(id) FROM prices AS px2
+                    WHERE px2.product_id = px.product_id
+                )
+            ) AS latest ON latest.product_id = p.id
+            ORDER BY p.id DESC
+        """).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            values = [
+                float(x['price']) for x in c.execute(
+                    'SELECT price FROM prices WHERE product_id=? ORDER BY id',
+                    (item['id'],)
+                )
+            ]
+            item['price'] = float(item['price'])
+            item['samples'] = len(values)
+            item.update(analyze(values))
+            out.append(item)
+        return out
+
 def seed():
  examples=[('Amazon México','Samsung Galaxy S25 Ultra 256GB','Phones','https://www.amazon.com.mx/dp/DEMO-S25',25999,15999),('Mercado Libre','OnePlus 13 256GB','Phones','https://www.mercadolibre.com.mx/p/DEMO-ONEPLUS',19999,11999),('Coppel','Laptop gaming RTX 4060','Laptops / PCs','https://www.coppel.com/demo-laptop',22999,12999),('Elektra','PlayStation 5','Gaming consoles','https://www.elektra.mx/demo-ps5',12999,5999),('Amazon México','Tablet Android 11 pulgadas','Tablets','https://www.amazon.com.mx/dp/DEMO-TABLET',8999,4999),('Coppel','Smart TV 55 pulgadas','TVs','https://www.coppel.com/demo-tv',14999,7999)]
  for store,title,cat,url,old,new in examples:
