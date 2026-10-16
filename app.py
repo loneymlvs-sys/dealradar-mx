@@ -35,6 +35,77 @@ def db():
     c.row_factory = sqlite3.Row
     return c
 
+def save_ml_tokens(data):
+    """Save Mercado Libre tokens in Supabase."""
+    from datetime import timedelta
+
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is required for token storage")
+
+    access = data["access_token"]
+    refresh = data["refresh_token"]
+    expires = datetime.now(timezone.utc) + timedelta(
+        seconds=int(data.get("expires_in", 21600))
+    )
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO public.mercadolibre_tokens
+                (id, access_token, refresh_token, expires_at, updated_at)
+            VALUES (1, %s, %s, %s, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                access_token = EXCLUDED.access_token,
+                refresh_token = EXCLUDED.refresh_token,
+                expires_at = EXCLUDED.expires_at,
+                updated_at = NOW()
+            """,
+            (access, refresh, expires)
+        )
+
+
+def get_ml_token():
+    """Return a valid access token, refreshing it when needed."""
+    from datetime import timedelta
+
+    if not DATABASE_URL:
+        return ML_TOKEN or None
+
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT access_token, refresh_token, expires_at
+            FROM public.mercadolibre_tokens
+            WHERE id = 1
+            """
+        ).fetchone()
+
+    if not row:
+        return ML_TOKEN or None
+
+    if row["expires_at"] > datetime.now(timezone.utc) + timedelta(minutes=5):
+        return row["access_token"]
+
+    payload = urlencode({
+        "grant_type": "refresh_token",
+        "client_id": ML_CLIENT_ID,
+        "client_secret": ML_CLIENT_SECRET,
+        "refresh_token": row["refresh_token"]
+    }).encode()
+
+    request = urllib.request.Request(
+        "https://api.mercadolibre.com/oauth/token",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST"
+    )
+
+    with urllib.request.urlopen(request, timeout=20) as response:
+        refreshed = json.load(response)
+
+    save_ml_tokens(refreshed)
+    return refreshed["access_token"]
+
 def init():
     if DATABASE_URL:
         return
@@ -182,15 +253,16 @@ def seed():
 SEARCHES=[('Phones','Samsung Galaxy S Ultra'),('Phones','OnePlus smartphone'),('Phones','iPhone'),('Laptops / PCs','laptop gamer'),('Laptops / PCs','PC gamer'),('Gaming consoles','PlayStation 5'),('Gaming consoles','Xbox Series X'),('Tablets','Samsung Galaxy Tab'),('TVs','Smart TV 55')]
 
 def scan_once():
- if not ML_TOKEN:
-  SCAN_STATE.update(status='authorization required',last_error='Set MERCADOLIBRE_ACCESS_TOKEN in Render Environment')
+ token = get_ml_token()
+ if not token:
+  SCAN_STATE.update(status='authorization required',last_error='Connect Mercado Libre at /oauth/login')
   return 0
  SCAN_STATE.update(status='scanning',last_attempt=timestamp(),last_error=None)
  total=0; errors=[]
  for category,query in SEARCHES:
   try:
    endpoint='https://api.mercadolibre.com/sites/MLM/search?'+urlencode({'q':query,'limit':15})
-   req=urllib.request.Request(endpoint,headers={'Authorization':'Bearer '+ML_TOKEN,'Accept':'application/json','User-Agent':'DealRadarMX/1.3'})
+   req=urllib.request.Request(endpoint,headers={'Authorization':'Bearer '+token,'Accept':'application/json','User-Agent':'DealRadarMX/1.3'})
    with urllib.request.urlopen(req,timeout=20) as response:payload=json.load(response)
    for item in payload.get('results',[]):
     try:
@@ -297,6 +369,14 @@ class Handler(BaseHTTPRequestHandler):
 
             if not token_data.get('access_token'):
                 return self.send(502, {'error': 'No access token returned'})
+            if not token_data.get('refresh_token'):
+                return self.send(502, {'error': 'No refresh token returned'})
+
+            try:
+                save_ml_tokens(token_data)
+            except Exception:
+                print('OAuth token storage failed (details withheld)')
+                return self.send(502, {'error': 'Secure token storage failed'})
 
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain; charset=utf-8')
@@ -307,8 +387,8 @@ class Handler(BaseHTTPRequestHandler):
             )
             self.end_headers()
             self.wfile.write(
-                b'Mercado Libre authorization succeeded. '
-                b'Secure token storage still needs to be configured.'
+                b'Mercado Libre connected successfully. '
+                b'Tokens saved securely.'
             )
             return
 
